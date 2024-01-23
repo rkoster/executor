@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -57,7 +58,7 @@ func New(logger lager.Logger, timeout time.Duration, tlsConfig *tls.Config) Uplo
 func (uploader *URLUploader) Upload(fileLocation string, url *url.URL, cancel <-chan struct{}) (int64, error) {
 	logger := uploader.logger.WithData(lager.Data{"fileLocation": fileLocation})
 
-	sourceFile, bytesToUpload, contentMD5, err := uploader.prepareFileForUpload(fileLocation, logger)
+	sourceFile, bytesToUpload, contentMD5, contentSHA256, err := uploader.prepareFileForUpload(fileLocation, logger)
 	if err != nil {
 		return 0, err
 	}
@@ -71,6 +72,7 @@ UPLOAD_ATTEMPTS:
 			sourceFile,
 			bytesToUpload,
 			contentMD5,
+			contentSHA256,
 			url.String(),
 			cancel,
 			logger,
@@ -95,35 +97,45 @@ UPLOAD_ATTEMPTS:
 	return int64(bytesToUpload), nil
 }
 
-func (uploader *URLUploader) prepareFileForUpload(fileLocation string, logger lager.Logger) (*os.File, int64, string, error) {
+func (uploader *URLUploader) prepareFileForUpload(fileLocation string, logger lager.Logger) (*os.File, int64, string, string, error) {
 	sourceFile, err := os.Open(fileLocation)
 	if err != nil {
 		logger.Error("failed-open", err)
-		return nil, 0, "", err
+		return nil, 0, "", "", err
 	}
 
 	fileInfo, err := sourceFile.Stat()
 	if err != nil {
 		logger.Error("failed-stat", err)
-		return nil, 0, "", err
+		return nil, 0, "", "", err
 	}
 
-	contentHash := md5.New()
-	_, err = io.Copy(contentHash, sourceFile)
+	contentHashMD5 := md5.New()
+	_, err = io.Copy(contentHashMD5, sourceFile)
 	if err != nil {
 		logger.Error("failed-copy", err)
-		return nil, 0, "", err
+		return nil, 0, "", "", err
 	}
 
-	contentMD5 := base64.StdEncoding.EncodeToString(contentHash.Sum(nil))
+	contentMD5 := base64.StdEncoding.EncodeToString(contentHashMD5.Sum(nil))
 
-	return sourceFile, fileInfo.Size(), contentMD5, nil
+	contentHashSHA256 := sha256.New()
+	_, err = io.Copy(contentHashSHA256, sourceFile)
+	if err != nil {
+		logger.Error("failed-copy", err)
+		return nil, 0, "", "", err
+	}
+
+	contentSHA256 := base64.StdEncoding.EncodeToString(contentHashSHA256.Sum(nil))
+
+	return sourceFile, fileInfo.Size(), contentMD5, contentSHA256, nil
 }
 
 func (uploader *URLUploader) attemptUpload(
 	sourceFile *os.File,
 	bytesToUpload int64,
 	contentMD5 string,
+	contentSHA256 string,
 	url string,
 	cancelCh <-chan struct{},
 	logger lager.Logger,
@@ -143,6 +155,7 @@ func (uploader *URLUploader) attemptUpload(
 	request.ContentLength = bytesToUpload
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.Header.Set("Content-MD5", contentMD5)
+	request.Header.Set("Content-Digest", fmt.Sprintf("sha-256=:%s:", contentSHA256))
 
 	var resp *http.Response
 	reqComplete := make(chan error)
